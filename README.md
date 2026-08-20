@@ -17,7 +17,7 @@ cd web
 python -m http.server 8000    # or: npx serve .
 ```
 
-Then open <http://localhost:8000>.
+Then open <http://localhost:8000/> .
 
 ## Current state
 
