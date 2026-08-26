@@ -1,0 +1,11 @@
+{
+  "majority_class_baseline": 0.24714405126776262,
+  "ann_test_accuracy": 0.29033156868208415,
+  "cnn_test_accuracy": 0.6167456115909724,
+  "cnn_macro_f1": 0.5641915938862964,
+  "epochs": {
+    "ann": 30,
+    "cnn": 60
+  },
+  "environment": "python 3.13.5 | tensorflow 2.20.0 | tf_keras 2.20.1 (Keras 2) | export target: TF.js Layers"
+}

@@ -1,0 +1,23 @@
+{
+  "modelName": "cnn",
+  "format": "tfjs_graph_model",
+  "emotions": [
+    "angry",
+    "disgust",
+    "fear",
+    "happy",
+    "neutral",
+    "sad",
+    "surprise"
+  ],
+  "inputShape": [
+    1,
+    48,
+    48,
+    1
+  ],
+  "preprocessing": {
+    "method": "per_image_standardization",
+    "note": "Grayscale face crop resized to 48x48, then (x - mean) / (std + 1e-6) computed over that single image. Must match standardize() in training/data.py and standardize() in web/index.html."
+  }
+}

@@ -28,9 +28,15 @@
   .stage { position: relative; width: 640px; max-width: 100%; }
   video, canvas#overlay {
     width: 100%; border-radius: 10px; display: block;
-    background: #000; border: 1px solid var(--border);
+    border: 1px solid var(--border);
   }
-  canvas#overlay { position: absolute; inset: 0; }
+  video { background: #000; }
+  /* The overlay sits on top of the video, so it must stay transparent —
+     giving it a background colour paints an opaque sheet over the face. */
+  canvas#overlay {
+    position: absolute; inset: 0; height: 100%;
+    background: transparent; pointer-events: none;
+  }
   .panel {
     background: var(--panel); border: 1px solid var(--border);
     border-radius: 10px; padding: 16px; min-width: 290px; flex: 1;
@@ -67,12 +73,19 @@
 <body>
 
 <h1>Mood Mirror</h1>
-<div class="sub">Step 0 &mdash; pipeline shell running the pretrained model. The classifier is swapped out in Phase 2.</div>
+<div class="sub">
+  Self-trained CNN &mdash; 61.7% on the FER2013 test set, trained from scratch.
+  Click <b>Load custom CNN</b> to swap it in; the pretrained model stays available for comparison.
+</div>
 
 <div class="controls">
   <button id="start">Start camera</button>
   <button id="stop" class="ghost" disabled>Stop</button>
   <button id="reset" class="ghost">Reset stats</button>
+  <button id="swap" class="ghost">Load custom CNN</button>
+  <button id="align" class="ghost">Alignment: on</button>
+  <button id="tta" class="ghost">TTA: on</button>
+  <button id="boost" class="ghost">Low-light: auto</button>
 </div>
 <div id="status">Idle. Must be served over http://localhost &mdash; opening this file directly will not work.</div>
 
@@ -86,6 +99,7 @@
     <div class="panel">
       <h2>Prediction</h2>
       <div class="big" id="emoji">&mdash;</div>
+      <div class="row"><span>Classifier</span><b id="clf">Human (pretrained)</b></div>
       <div class="row"><span>Smoothed</span><b id="smoothed">&mdash;</b></div>
       <div class="row"><span>Raw (this frame)</span><b id="raw">&mdash;</b></div>
       <div class="row"><span>Confidence</span><b id="conf">&mdash;</b></div>
@@ -100,21 +114,47 @@
       <div class="row"><span>Raw label changes</span><b id="rawch">0</b></div>
       <div class="row"><span>Smoothed label changes</span><b id="smch">0</b></div>
       <div class="row"><span>Flicker reduction</span><b id="reduction">&mdash;</b></div>
+      <div class="row"><span>Scene brightness</span><b id="luma">&mdash;</b></div>
     </div>
 
     <div class="panel">
       <h2>Model input (parity check)</h2>
-      <canvas id="crop" width="48" height="48"></canvas>
+      <div style="display:flex; gap:14px; align-items:flex-start; flex-wrap:wrap;">
+        <div>
+          <canvas id="crop" width="48" height="48"></canvas>
+          <div class="cropnote" style="text-align:center;">live &mdash; <span id="cropmode">&mdash;</span></div>
+        </div>
+        <div>
+          <img id="meanface" src="model/fer2013_mean_face.png" alt="FER2013 mean face"
+               style="width:96px;height:96px;border:1px solid var(--border);border-radius:6px;
+                      image-rendering:pixelated;display:block;"
+               onerror="this.style.display='none'">
+          <div class="cropnote" style="text-align:center;">FER2013 target</div>
+        </div>
+      </div>
       <div class="cropnote">
-        The exact 48&times;48 grayscale crop the CNN will receive. Phase 1 training
-        preprocessing must match this or browser accuracy will not track test accuracy.
+        Left is the exact 48&times;48 grayscale crop the CNN receives. Right is the
+        average of all 25,841 FER2013 training faces &mdash; the framing the model was
+        trained on. <b>Match the eye line and face width to it.</b> Alignment puts the
+        eye midpoint at (0.50, 0.354) with an inter-ocular distance of 0.375&times;width,
+        which is that average measured directly.
+      </div>
+      <div style="margin-top:10px;">
+        <img id="refsheet" src="model/fer2013_reference.png" alt="FER2013 samples"
+             style="width:100%;border:1px solid var(--border);border-radius:6px;
+                    image-rendering:pixelated;display:block;"
+             onerror="this.style.display='none'">
+        <div class="cropnote">
+          Real training faces &mdash; rows: angry, disgust, fear, happy, neutral, sad,
+          surprise. Leftmost column is each class&rsquo;s mean face.
+        </div>
       </div>
     </div>
   </div>
 </div>
 
 <script type="module">
-import Human from 'https://cdn.jsdelivr.net/npm/@vladmandic/human/dist/human.esm.js';
+import Human from 'https://cdn.jsdelivr.net/npm/@vladmandic/human@3.3.6/dist/human.esm.js';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -123,25 +163,73 @@ const EMOJI = {
   happy: '\u{1F604}', sad: '\u{1F622}', angry: '\u{1F620}', surprise: '\u{1F632}',
   fear: '\u{1F628}', disgust: '\u{1F922}', neutral: '\u{1F610}',
 };
-const SMOOTHING_WINDOW = 8;   // frames in the majority-vote buffer
-const CROP_MARGIN = 0.15;     // expand detector box; tune to match FER2013 framing
+const SMOOTHING_WINDOW = 8;   // frames averaged by the probability smoother
+const CROP_MARGIN = 0.15;     // unaligned fallback only: detector-box expansion
 
-const human = new Human({
-  backend: 'webgl',
-  modelBasePath: 'https://cdn.jsdelivr.net/npm/@vladmandic/human/models/',
-  face: {
-    enabled: true,
-    detector: { rotation: false, maxDetected: 1 },
-    mesh: { enabled: false },
-    iris: { enabled: false },
-    description: { enabled: false },
-    emotion: { enabled: true },
-  },
-  body: { enabled: false },
-  hand: { enabled: false },
-  object: { enabled: false },
-  gesture: { enabled: false },
-});
+// Below this smoothed confidence the label is shown as "unsure" rather than
+// committed to. On 7 classes chance is 0.143, and FER2013 models are genuinely
+// uncertain on ambiguous faces — showing a confident wrong emoji is worse than
+// admitting it. Tune via window.moodMirror.setConfidenceThreshold().
+let CONF_THRESHOLD = 0.35;
+let ttaEnabled = true;        // average prediction over horizontal mirror
+
+// Backend negotiation.
+//
+// The emotion model is a CNN, and tfjs only registers conv kernels for the
+// backend it actually starts on. Hard-requiring 'webgl' means that on a machine
+// with hardware acceleration off (or a blocklisted GPU driver) tfjs silently
+// lands on 'cpu' and the first conv layer throws
+// "Kernel 'FusedConv2D' not registered for backend 'cpu'" — which reads like the
+// CNN is unsupported, but is really a missing WebGL context. So: probe first,
+// fall back to WebAssembly, and say out loud which backend won.
+const TFJS_VERSION = '4.22.0';   // must match the tfjs bundled inside human@3.3.6
+const WASM_PATH = `https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@${TFJS_VERSION}/dist/`;
+const MODEL_BASE = 'https://cdn.jsdelivr.net/npm/@vladmandic/human@3.3.6/models/';
+
+function probeWebGL() {
+  try {
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl2') || c.getContext('webgl');
+    if (!gl) return null;
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    return dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)) : 'WebGL';
+  } catch {
+    return null;
+  }
+}
+
+function humanConfig(backend) {
+  return {
+    backend,
+    wasmPath: WASM_PATH,
+    modelBasePath: MODEL_BASE,
+    face: {
+      enabled: true,
+      // minConfidence is lowered from the 0.2 default because in dim light the
+      // detector's score drops before its localisation actually degrades — it
+      // still knows where the face is, it is just less sure it is a face. At
+      // 0.2 that shows up as the overlay vanishing entirely in low light.
+      detector: { rotation: false, maxDetected: 1, minConfidence: 0.12 },
+      // Mesh is on solely to get eye landmarks for crop alignment. It costs a
+      // few ms per frame and buys back far more than that in real-world
+      // accuracy — see ALIGNMENT below.
+      mesh: { enabled: true },
+      iris: { enabled: false },
+      description: { enabled: false },
+      emotion: { enabled: true },
+    },
+    body: { enabled: false },
+    hand: { enabled: false },
+    object: { enabled: false },
+    gesture: { enabled: false },
+  };
+}
+
+const gpu = probeWebGL();
+let human = new Human(humanConfig(gpu ? 'webgl' : 'wasm'));
+
+// Exposed for console-driven experiments and the Phase 2 classifier swap.
+window.moodMirror = { human, humanConfig, setClassifier: (c) => { classifier = c; } };
 
 // ---------------------------------------------------------------------------
 // Classifier boundary.
@@ -150,37 +238,140 @@ const human = new Human({
 // self-trained CNN. Everything downstream (smoothing, overlay, benchmarks)
 // stays untouched, which is the point of building this shell first.
 // ---------------------------------------------------------------------------
+// Canonical label order, matching training/compat.py EMOTIONS. Both classifiers
+// emit probabilities in this order so the smoother can average across a swap.
+const LABELS = ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise'];
+
 const PretrainedClassifier = {
   name: 'Human (pretrained)',
-  // `face` is a Human face result; returns { label, confidence }.
+  labels: LABELS,
+  // `face` is a Human face result. Returns { label, confidence, probs } where
+  // probs is aligned to LABELS — Human reports only the emotions it scored, so
+  // missing ones are zero-filled rather than left undefined.
   classify(face) {
     if (!face.emotion || face.emotion.length === 0) return null;
-    const top = face.emotion.reduce((a, b) => (b.score > a.score ? b : a));
-    return { label: top.emotion, confidence: top.score };
+    const probs = new Float32Array(LABELS.length);
+    for (const e of face.emotion) {
+      const i = LABELS.indexOf(e.emotion);
+      if (i >= 0) probs[i] = e.score;
+    }
+    let best = 0;
+    for (let i = 1; i < probs.length; i++) if (probs[i] > probs[best]) best = i;
+    return { label: LABELS[best], confidence: probs[best], probs, labels: LABELS };
   },
 };
 
 let classifier = PretrainedClassifier;
 
 // ---------------------------------------------------------------------------
+// The self-trained CNN.
+//
+// PARITY CONTRACT — this must match training/data.py exactly:
+//   grayscale  ->  48x48  ->  (x - mean) / (std + 1e-6)  over that one image
+// The mean/std are per-image, not dataset-wide, which is what lets the model
+// cope with a dim or washed-out webcam: each frame's own brightness and
+// contrast are divided out before the CNN sees it. Changing this without
+// changing data.standardize() silently destroys accuracy — the model keeps
+// predicting, just badly, so there is no error to notice.
+// ---------------------------------------------------------------------------
+const CROP_PX = 48;
+const STD_EPS = 1e-6;   // == data.py EPS
+
+// Reads the 48x48 crop canvas (already grayscale) and standardizes it.
+// numpy's std is the population std (divide by N), so this does too.
+function standardizeCrop() {
+  const px = cctx.getImageData(0, 0, CROP_PX, CROP_PX).data;
+  const n = CROP_PX * CROP_PX;
+  const gray = new Float32Array(n);
+  for (let i = 0, p = 0; i < n; i++, p += 4) gray[i] = px[p];
+
+  let sum = 0;
+  for (let i = 0; i < n; i++) sum += gray[i];
+  const mean = sum / n;
+
+  let sq = 0;
+  for (let i = 0; i < n; i++) { const d = gray[i] - mean; sq += d * d; }
+  const std = Math.sqrt(sq / n);
+
+  const out = new Float32Array(n);
+  const inv = 1 / (std + STD_EPS);
+  for (let i = 0; i < n; i++) out[i] = (gray[i] - mean) * inv;
+  return out;
+}
+
+async function loadCustomCNN(base = 'model/cnn') {
+  const tf = human.tf;
+  const meta = await fetch(`${base}/metadata.json`).then((r) => (r.ok ? r.json() : null));
+  const labels = meta?.emotions ?? [
+    'angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise',
+  ];
+  // loadGraphModel, not loadLayersModel: the tfjs bundled inside Human ships
+  // tfjs-core + tfjs-converter but NOT tfjs-layers, so `tf.loadLayersModel` is
+  // undefined on `human.tf`. export_tfjs.py emits a graph model for this reason.
+  if (typeof tf.loadGraphModel !== 'function') {
+    throw new Error('human.tf exposes no loadGraphModel — unexpected Human build');
+  }
+  const model = await tf.loadGraphModel(`${base}/model.json`);
+
+  return {
+    name: 'Custom CNN (self-trained)',
+    labels,
+    model,
+    // `face` is unused — this classifier reads the parity crop, not the raw box,
+    // which is exactly the guarantee we want: what you see in the parity panel
+    // is literally what the network is fed.
+    classify() {
+      const probs = tf.tidy(() => {
+        const x = tf.tensor4d(standardizeCrop(), [1, CROP_PX, CROP_PX, 1]);
+        if (!ttaEnabled) return model.predict(x).dataSync();
+        // Test-time augmentation: average the prediction over the image and its
+        // mirror. Faces are near-symmetric and training used horizontal flips,
+        // so the mirror is in-distribution and averaging cancels some of the
+        // model's left/right asymmetry. Costs one extra forward pass.
+        const flipped = tf.reverse(x, 2);
+        const a = model.predict(x);
+        const b = model.predict(flipped);
+        return a.add(b).div(2).dataSync();
+      });
+      let best = 0;
+      for (let i = 1; i < probs.length; i++) if (probs[i] > probs[best]) best = i;
+      return { label: labels[best], confidence: probs[best], probs, labels };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Smoothing: majority vote over a rolling buffer
 // ---------------------------------------------------------------------------
-class SmoothingBuffer {
-  constructor(size) { this.size = size; this.buf = []; }
-  push(label) {
-    this.buf.push(label);
+// Averages the probability vectors over the window rather than taking a
+// majority vote of arg-maxes.
+//
+// Majority voting throws away everything except each frame's winner, so eight
+// frames of "sad 0.34 / neutral 0.33" outvote one frame of "sad 0.95". Averaging
+// keeps the magnitudes, which both stabilizes the label and yields a smoothed
+// *confidence* — and that confidence is what makes gating possible below.
+class ProbabilitySmoother {
+  constructor(size) { this.size = size; this.buf = []; this.labels = null; }
+
+  push(probs, labels) {
+    // A classifier swap changes the label space; stale vectors would be summed
+    // against the wrong classes.
+    if (this.labels && this.labels.join() !== labels.join()) this.clear();
+    this.labels = labels;
+
+    this.buf.push(Float32Array.from(probs));
     if (this.buf.length > this.size) this.buf.shift();
-    return this.majority();
+
+    const n = labels.length;
+    const avg = new Float64Array(n);
+    for (const p of this.buf) for (let i = 0; i < n; i++) avg[i] += p[i];
+
+    let best = 0;
+    for (let i = 1; i < n; i++) if (avg[i] > avg[best]) best = i;
+    return { label: labels[best], confidence: avg[best] / this.buf.length };
   }
-  majority() {
-    if (this.buf.length === 0) return null;
-    const counts = new Map();
-    for (const l of this.buf) counts.set(l, (counts.get(l) || 0) + 1);
-    let best = null, bestN = -1;
-    for (const [l, n] of counts) if (n > bestN) { best = l; bestN = n; }
-    return best;
-  }
-  clear() { this.buf = []; }
+
+  clear() { this.buf = []; this.labels = null; }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +418,7 @@ const video = $('video'), overlay = $('overlay'), cropCanvas = $('crop');
 const octx = overlay.getContext('2d');
 const cctx = cropCanvas.getContext('2d', { willReadFrequently: true });
 
-const smoother = new SmoothingBuffer(SMOOTHING_WINDOW);
+const smoother = new ProbabilitySmoother(SMOOTHING_WINDOW);
 let stream = null, running = false;
 
 function setStatus(msg, isError = false) {
@@ -239,23 +430,186 @@ function setStatus(msg, isError = false) {
 // Face crop -> 48x48 grayscale. This is the parity-critical step: whatever it
 // does here must be mirrored exactly in the Python training pipeline.
 // ---------------------------------------------------------------------------
-function drawFaceCrop(box) {
-  const [x, y, w, h] = box;
-  const mx = w * CROP_MARGIN, my = h * CROP_MARGIN;
-  const sx = Math.max(0, x - mx / 2), sy = Math.max(0, y - my / 2);
-  const sw = Math.min(video.videoWidth - sx, w + mx);
-  const sh = Math.min(video.videoHeight - sy, h + my);
+// ---------------------------------------------------------------------------
+// LOW-LIGHT GAIN
+//
+// Per-image standardization already removes brightness and contrast from the
+// *classifier's* input, so dim light does not hurt classification much. The
+// detector is the part that fails: BlazeFace scores a dark, low-contrast face
+// lower, and once it drops under minConfidence the face disappears entirely —
+// no box, no emoji, nothing. That is the "it only works in good lighting"
+// symptom, and it happens upstream of the CNN.
+//
+// So the frame is brightened *before* detection. The detector gets a workable
+// image; the crop is taken from the same enhanced frame so the parity panel
+// shows exactly what was classified.
+//
+// This is close to parity-neutral by construction: a uniform brightness/contrast
+// change shifts the crop's mean and scales its std, and standardize() divides
+// both straight back out. Gain is capped to avoid clipping highlights, which
+// standardization cannot undo because the information is genuinely gone.
+// ---------------------------------------------------------------------------
+const TARGET_LUMA = 118;    // roughly FER2013's mean pixel value
+const MAX_GAIN = 2.2;
 
-  cctx.drawImage(video, sx, sy, sw, sh, 0, 0, 48, 48);
+let boostMode = 'auto';     // 'auto' | 'on' | 'off'
+let measuredLuma = null, appliedGain = 1;
 
-  // Luminance conversion, matching PIL's "L" mode coefficients.
-  const img = cctx.getImageData(0, 0, 48, 48);
+const enhCanvas = document.createElement('canvas');
+const enhCtx = enhCanvas.getContext('2d', { willReadFrequently: false });
+const meterCanvas = document.createElement('canvas');
+meterCanvas.width = meterCanvas.height = 32;
+const meterCtx = meterCanvas.getContext('2d', { willReadFrequently: true });
+
+// Mean luminance of the frame, sampled at 32x32 so it costs almost nothing.
+function measureLuma() {
+  meterCtx.drawImage(video, 0, 0, 32, 32);
+  const d = meterCtx.getImageData(0, 0, 32, 32).data;
+  let sum = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+  }
+  return sum / (d.length / 4);
+}
+
+// Returns the element to detect and crop from: the raw video when no gain is
+// needed, otherwise a brightened copy.
+let lumaTick = 0;
+function getFrameSource() {
+  if (boostMode === 'off') { appliedGain = 1; return video; }
+
+  // Re-meter a few times a second rather than every frame; lighting does not
+  // change at 30fps and getImageData is the expensive part.
+  if (lumaTick++ % 10 === 0) measuredLuma = measureLuma();
+  if (measuredLuma === null) return video;
+
+  const needed = TARGET_LUMA / Math.max(measuredLuma, 1);
+  appliedGain = boostMode === 'on'
+    ? Math.min(MAX_GAIN, Math.max(1, needed))
+    : (measuredLuma < TARGET_LUMA * 0.85 ? Math.min(MAX_GAIN, needed) : 1);
+
+  if (appliedGain <= 1.02) { appliedGain = 1; return video; }
+
+  if (enhCanvas.width !== video.videoWidth || enhCanvas.height !== video.videoHeight) {
+    enhCanvas.width = video.videoWidth;
+    enhCanvas.height = video.videoHeight;
+  }
+  // A little extra contrast alongside the brightness: lifting a dark frame
+  // uniformly makes it grey and flat, and the detector keys on edges.
+  enhCtx.filter = `brightness(${appliedGain.toFixed(3)}) contrast(${(1 + (appliedGain - 1) * 0.5).toFixed(3)})`;
+  enhCtx.drawImage(video, 0, 0);
+  enhCtx.filter = 'none';
+  return enhCanvas;
+}
+
+// The element the current frame was detected and cropped from.
+let frameSource = null;
+
+// ---------------------------------------------------------------------------
+// ALIGNMENT
+//
+// FER2013 is not a set of arbitrary face photos — it is a set of *consistently
+// framed* ones. Averaging all 25,841 training faces produces a sharp mean face
+// rather than a blur, which only happens when eye position and face scale
+// barely vary across the dataset. Measuring that mean face gives the exact
+// convention the model was trained under:
+//
+//     eye midpoint          (0.500, 0.354) of the 48x48 crop
+//     inter-ocular distance 0.375 of width  (18 px)
+//
+// The raw detector box reproduces none of that. It follows head tilt, it frames
+// loosely, and its scale drifts with distance from the camera. So a model that
+// scores 60%+ on FER2013 sees noticeably out-of-distribution input from a
+// webcam, and gets worse predictions for reasons that have nothing to do with
+// how well it was trained.
+//
+// Aligning the live crop to the measured geometry fixes that mismatch without
+// retraining — it makes the webcam produce the same kind of image the model
+// already learned from.
+// ---------------------------------------------------------------------------
+const FER = {
+  eyeX: 0.500,   // eye-midpoint x, fraction of crop width
+  eyeY: 0.354,   // eye-midpoint y, fraction of crop height
+  iod: 0.375,    // inter-ocular distance, fraction of crop width
+};
+let alignEnabled = true;
+
+// MediaPipe FaceMesh indices for the eye corners Human returns in face.mesh.
+const EYE_IDX = { rOuter: 33, rInner: 133, lInner: 362, lOuter: 263 };
+
+function eyeCentersFrom(face) {
+  const m = face.mesh;
+  if (!m || m.length < 468) return null;
+  const mid = (a, b) => [(m[a][0] + m[b][0]) / 2, (m[a][1] + m[b][1]) / 2];
+  return {
+    right: mid(EYE_IDX.rOuter, EYE_IDX.rInner),   // subject's right = image left
+    left: mid(EYE_IDX.lInner, EYE_IDX.lOuter),
+  };
+}
+
+// Maps the video frame into the 48x48 crop so the eyes land exactly on the
+// FER2013 geometry: rotated level, scaled to the target inter-ocular distance,
+// positioned at the target midpoint.
+function drawAlignedCrop(eyes) {
+  const [rx, ry] = eyes.right;
+  const [lx, ly] = eyes.left;
+
+  const iod = Math.hypot(lx - rx, ly - ry);
+  if (!(iod > 1)) return false;
+
+  const angle = Math.atan2(ly - ry, lx - rx);      // head roll
+  const scale = (FER.iod * CROP_PX) / iod;
+  const mx = (rx + lx) / 2, my = (ry + ly) / 2;    // eye midpoint in video px
+
+  cctx.save();
+  cctx.setTransform(1, 0, 0, 1, 0, 0);
+  cctx.fillStyle = '#000';
+  cctx.fillRect(0, 0, CROP_PX, CROP_PX);
+  cctx.translate(FER.eyeX * CROP_PX, FER.eyeY * CROP_PX);
+  cctx.rotate(-angle);
+  cctx.scale(scale, scale);
+  cctx.translate(-mx, -my);
+  cctx.drawImage(frameSource || video, 0, 0);
+  cctx.restore();
+
+  toGrayscale();
+  return true;
+}
+
+// Luminance conversion, matching PIL's "L" mode coefficients. Split out so both
+// crop paths share it.
+function toGrayscale() {
+  const img = cctx.getImageData(0, 0, CROP_PX, CROP_PX);
   const d = img.data;
   for (let i = 0; i < d.length; i += 4) {
     const g = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
     d[i] = d[i + 1] = d[i + 2] = g;
   }
   cctx.putImageData(img, 0, 0);
+}
+
+// Unaligned fallback: straight detector-box crop. Used when the mesh is
+// unavailable, and kept switchable so the two can be compared side by side.
+function drawBoxCrop(box) {
+  const [x, y, w, h] = box;
+  const mx = w * CROP_MARGIN, my = h * CROP_MARGIN;
+  const sx = Math.max(0, x - mx / 2), sy = Math.max(0, y - my / 2);
+  const sw = Math.min(video.videoWidth - sx, w + mx);
+  const sh = Math.min(video.videoHeight - sy, h + my);
+
+  cctx.drawImage(frameSource || video, sx, sy, sw, sh, 0, 0, CROP_PX, CROP_PX);
+  toGrayscale();
+}
+
+// Prefers the aligned path; falls back to the raw box if landmarks are missing
+// (mesh disabled, or the face is too far off-angle for the mesh to resolve).
+function drawFaceCrop(face) {
+  if (alignEnabled) {
+    const eyes = eyeCentersFrom(face);
+    if (eyes && drawAlignedCrop(eyes)) return 'aligned';
+  }
+  drawBoxCrop(face.box);
+  return 'box';
 }
 
 function drawOverlay(box, emoji) {
@@ -280,6 +634,9 @@ function renderStats() {
   $('fps').textContent = fps === null ? '—' : fps.toFixed(1);
   $('rawch').textContent = stats.rawChanges;
   $('smch').textContent = stats.smoothChanges;
+  $('luma').textContent = measuredLuma === null
+    ? '—'
+    : `${measuredLuma.toFixed(0)}/255${appliedGain > 1 ? `  (gain ${appliedGain.toFixed(2)}x)` : ''}`;
   $('reduction').textContent = stats.rawChanges === 0
     ? '—'
     : `${(100 * (1 - stats.smoothChanges / stats.rawChanges)).toFixed(1)}%`;
@@ -291,26 +648,39 @@ function renderStats() {
 async function loop() {
   if (!running) return;
 
+  frameSource = getFrameSource();
+
   const t0 = performance.now();
-  const result = await human.detect(video);
+  const result = await human.detect(frameSource);
   const latency = performance.now() - t0;
 
   octx.clearRect(0, 0, overlay.width, overlay.height);
 
   const face = result.face && result.face[0];
   if (face) {
+    // The crop must exist before classify() runs: the custom CNN reads it as
+    // its input, so drawing it afterwards would feed the model the *previous*
+    // frame's face.
+    const cropMode = drawFaceCrop(face);
+    $('cropmode').textContent = cropMode === 'aligned' ? 'aligned to FER2013' : 'raw detector box';
+
     const prediction = classifier.classify(face);
     if (prediction) {
-      const smoothed = smoother.push(prediction.label);
-      stats.record(latency, prediction.label, smoothed);
+      const sm = smoother.push(prediction.probs, prediction.labels);
+      stats.record(latency, prediction.label, sm.label);
 
-      drawFaceCrop(face.box);
-      drawOverlay(face.box, EMOJI[smoothed] || '');
+      // Gate on the smoothed confidence, not the single-frame one: a lone
+      // confident frame in a noisy run is exactly what we do not want to trust.
+      const sure = sm.confidence >= CONF_THRESHOLD;
+      const shown = sure ? (EMOJI[sm.label] || '—') : '🤔';
 
-      $('emoji').textContent = EMOJI[smoothed] || '—';
-      $('smoothed').textContent = smoothed;
+      drawOverlay(face.box, sure ? (EMOJI[sm.label] || '') : '');
+
+      $('emoji').textContent = shown;
+      $('smoothed').textContent = sure ? sm.label : `unsure (${sm.label}?)`;
       $('raw').textContent = prediction.label;
-      $('conf').textContent = `${(prediction.confidence * 100).toFixed(1)}%`;
+      $('conf').textContent =
+        `${(sm.confidence * 100).toFixed(1)}%  (frame ${(prediction.confidence * 100).toFixed(0)}%)`;
     }
   } else {
     $('raw').textContent = 'no face';
@@ -327,30 +697,64 @@ async function start() {
   $('start').disabled = true;
   try {
     if (!navigator.mediaDevices?.getUserMedia) {
-      throw new Error('getUserMedia unavailable. Serve over http://localhost, not file://');
+      // Camera access requires a "secure context". Browsers grant that to
+      // https:// and to localhost (special-cased as trusted), but NOT to a
+      // plain-http LAN address — so opening http://192.168.x.x:8000 from a
+      // phone or another laptop lands here even though the page itself loads
+      // fine. There is no page-side workaround; the origin has to be secure.
+      const where = `${location.protocol}//${location.hostname}`;
+      throw new Error(
+        `Camera blocked: ${where} is not a secure context. ` +
+        `Browsers only allow getUserMedia on https:// or localhost. ` +
+        `To use this from another device, serve it over HTTPS ` +
+        `(a tunnel such as "cloudflared tunnel --url http://localhost:8000", ` +
+        `or deploy the web/ folder to any static host).`,
+      );
     }
-    setStatus('Loading models…');
-    await human.load();
+    setStatus(gpu ? `Loading models on WebGL (${gpu})…` : 'No WebGL — loading models on WebAssembly…');
+    try {
+      await human.load();
+      await human.warmup();
+    } catch (loadErr) {
+      // Anything that smells like a backend/kernel problem gets one retry on wasm.
+      const backendIssue = /kernel|backend|webgl|texture|shader|context/i.test(loadErr.message || '');
+      if (!backendIssue || human.config.backend === 'wasm') throw loadErr;
+      setStatus(`WebGL backend failed (${loadErr.message}) — retrying on WebAssembly…`);
+      human = new Human(humanConfig('wasm'));
+      window.moodMirror.human = human;
+      await human.load();
+      await human.warmup();
+    }
 
     stream = await navigator.mediaDevices.getUserMedia({
       video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
       audio: false,
     });
     video.srcObject = stream;
+    // play() can resolve before dimensions are known; without metadata the
+    // overlay would be sized 0x0 and every drawn box would vanish.
+    if (video.readyState < 1) {
+      await new Promise((res) => video.addEventListener('loadedmetadata', res, { once: true }));
+    }
     await video.play();
 
-    overlay.width = video.videoWidth;
-    overlay.height = video.videoHeight;
+    overlay.width = video.videoWidth || 640;
+    overlay.height = video.videoHeight || 480;
 
     const track = stream.getVideoTracks()[0];
     const s = track.getSettings();
-    setStatus(`Running — ${s.width}×${s.height} @ ${s.frameRate ?? '?'}fps — ${track.label}`);
+    setStatus(`Running on ${human.tf.getBackend()} — ${s.width}×${s.height} @ ${s.frameRate ?? '?'}fps — ${track.label}`);
 
     running = true;
     $('stop').disabled = false;
     loop();
   } catch (err) {
-    setStatus(`${err.name || 'Error'}: ${err.message}`, true);
+    const msg = err.message || String(err);
+    const hint = /not registered for backend|webgl|kernel/i.test(msg)
+      ? ' — this is a graphics-backend problem, not a model problem. Turn on hardware acceleration in your browser settings and reload, or use a browser where chrome://gpu reports WebGL as enabled.'
+      : '';
+    setStatus(`${err.name || 'Error'}: ${msg}${hint}`, true);
+    console.error('[mood-mirror] start failed', err);
     $('start').disabled = false;
   }
 }
@@ -368,6 +772,68 @@ function stop() {
 
 $('start').addEventListener('click', start);
 $('stop').addEventListener('click', stop);
+$('swap').addEventListener('click', async () => {
+  const btn = $('swap');
+  if (classifier !== PretrainedClassifier) {
+    classifier = PretrainedClassifier;
+    smoother.clear();
+    stats.reset();
+    $('clf').textContent = PretrainedClassifier.name;
+    btn.textContent = 'Load custom CNN';
+    setStatus('Switched back to the pretrained classifier.');
+    return;
+  }
+  btn.disabled = true;
+  try {
+    setStatus('Loading self-trained CNN from model/cnn/ …');
+    classifier = await loadCustomCNN();
+    smoother.clear();
+    stats.reset();
+    $('clf').textContent = classifier.name;
+    btn.textContent = 'Back to pretrained';
+    setStatus(`Loaded ${classifier.name}. Benchmarks reset for a fair comparison.`);
+  } catch (err) {
+    setStatus(
+      `Could not load model/cnn/model.json — ${err.message}. Train and export it first: ` +
+      `.venv\\Scripts\\python.exe training\\train.py, then training\\export_tfjs.py`,
+      true,
+    );
+    console.error('[mood-mirror] custom CNN load failed', err);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('boost').addEventListener('click', () => {
+  boostMode = boostMode === 'auto' ? 'on' : boostMode === 'on' ? 'off' : 'auto';
+  $('boost').textContent = `Low-light: ${boostMode}`;
+  setStatus(
+    boostMode === 'auto' ? 'Low-light boost: auto — applied only when the scene is dim.'
+    : boostMode === 'on' ? 'Low-light boost: always on.'
+    : 'Low-light boost off — raw camera frame.',
+  );
+});
+
+$('align').addEventListener('click', () => {
+  alignEnabled = !alignEnabled;
+  $('align').textContent = `Alignment: ${alignEnabled ? 'on' : 'off'}`;
+  smoother.clear();
+  stats.reset();
+  setStatus(
+    alignEnabled
+      ? 'Alignment on — crop is rotated and scaled to FER2013 geometry.'
+      : 'Alignment off — raw detector box, as the model previously saw it.',
+  );
+});
+
+$('tta').addEventListener('click', () => {
+  ttaEnabled = !ttaEnabled;
+  $('tta').textContent = `TTA: ${ttaEnabled ? 'on' : 'off'}`;
+  smoother.clear();
+  stats.reset();
+  setStatus(`Test-time augmentation ${ttaEnabled ? 'on (image + mirror)' : 'off'}.`);
+});
+
 $('reset').addEventListener('click', () => {
   stats.reset();
   smoother.clear();
@@ -375,8 +841,74 @@ $('reset').addEventListener('click', () => {
   setStatus('Stats reset.');
 });
 
-// Expose for console-driven experiments and the Phase 2 swap.
-window.moodMirror = { human, stats, smoother, setClassifier: (c) => { classifier = c; } };
+window.moodMirror.stats = stats;
+window.moodMirror.smoother = smoother;
+window.moodMirror.FER = FER;   // live-tunable crop geometry
+window.moodMirror.setConfidenceThreshold = (t) => { CONF_THRESHOLD = t; smoother.clear(); };
+
+// ---------------------------------------------------------------------------
+// End-to-end parity check. Feeds the exact pixels Python scored through the
+// TF.js runtime — including the JS standardize() — and reports the deviation.
+// This is what proves the browser and the training pipeline agree; test
+// accuracy is only meaningful for the webcam if this passes.
+//
+// Usage: click "Load custom CNN", then  await window.moodMirror.verifyParity()
+// ---------------------------------------------------------------------------
+// The fixture lives beside the model directory rather than inside it, because
+// export_tfjs.py wipes model/cnn/ on every re-export and would delete it.
+window.moodMirror.verifyParity = async function verifyParity(url = 'model/parity_check.json') {
+  if (classifier === PretrainedClassifier || !classifier.model) {
+    throw new Error('Load the custom CNN first (click "Load custom CNN").');
+  }
+  const tf = human.tf;
+  const fx = await fetch(url).then((r) => {
+    if (!r.ok) throw new Error(`${url} not found — run training/parity_check.py`);
+    return r.json();
+  });
+
+  let worst = 0, mismatches = 0;
+  for (const s of fx.samples) {
+    // Reproduce standardize() on the raw pixels, independent of the canvas
+    // path, so this tests the arithmetic rather than the crop plumbing.
+    const n = s.pixels.length;
+    let mean = 0;
+    for (let i = 0; i < n; i++) mean += s.pixels[i];
+    mean /= n;
+    let sq = 0;
+    for (let i = 0; i < n; i++) { const d = s.pixels[i] - mean; sq += d * d; }
+    const inv = 1 / (Math.sqrt(sq / n) + STD_EPS);
+    const x = new Float32Array(n);
+    for (let i = 0; i < n; i++) x[i] = (s.pixels[i] - mean) * inv;
+
+    const got = tf.tidy(() =>
+      classifier.model.predict(tf.tensor4d(x, [1, CROP_PX, CROP_PX, 1])).dataSync());
+
+    let d = 0;
+    for (let i = 0; i < got.length; i++) d = Math.max(d, Math.abs(got[i] - s.expected[i]));
+    worst = Math.max(worst, d);
+    if (d > fx.tolerance) mismatches++;
+  }
+
+  const pass = mismatches === 0;
+  const summary = {
+    pass,
+    samples: fx.samples.length,
+    maxDeviation: worst,
+    tolerance: fx.tolerance,
+    mismatches,
+  };
+  console.log(
+    `%c[parity] ${pass ? 'PASS' : 'FAIL'} — max deviation ${worst.toExponential(2)} over ${fx.samples.length} samples`,
+    `color:${pass ? '#3fb950' : '#f85149'};font-weight:bold`,
+  );
+  setStatus(
+    pass
+      ? `Parity OK — browser matches Python to ${worst.toExponential(2)} across ${fx.samples.length} samples.`
+      : `Parity FAILED — ${mismatches}/${fx.samples.length} samples deviate (max ${worst.toExponential(2)}).`,
+    !pass,
+  );
+  return summary;
+};
 </script>
 </body>
 </html>
