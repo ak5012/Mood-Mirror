@@ -1,0 +1,14 @@
+{
+  "model": "C:\\Users\\aksha\\Downloads\\Mood-Mirror\\Mood-Mirror\\artifacts\\cnn.h5",
+  "conditions": {
+    "clean": 0.6167456115909724,
+    "dim_only": 0.6167456115909724,
+    "dim_gamma": 0.6062970186681527,
+    "noisy": 0.42114795207578715,
+    "dim_noisy": 0.3207021454444135,
+    "blurry": 0.41877960434661465,
+    "low_res": 0.4104207300083589,
+    "jpeg": 0.5169963778211201,
+    "webcam_hard": 0.3165227082752856
+  }
+}
