@@ -26,7 +26,7 @@ import csv
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from compat import EMOTIONS
 
@@ -217,3 +217,101 @@ if __name__ == "__main__":
         print(f"  {name:5}", {e: int(c) for e, c in zip(EMOTIONS, counts)})
     s = preprocess_batch(Xtr[:8], augment=True)
     print(f"preprocessed {s.shape} {s.dtype} mean={s.mean():.3f} std={s.std():.3f}")
+
+
+# ---------------------------------------------------------------------------
+# Sensor degradation (training only)
+#
+# FER2013 is clean, evenly lit, and reasonably sharp. A real webcam in a dim
+# room is none of those. That distribution gap costs real-world accuracy even
+# when test accuracy looks fine, so the fix is to train on images that have
+# been pushed toward webcam conditions.
+#
+# What matters here is which degradations SURVIVE standardize(). Per-image
+# mean/std normalization is linear, so it removes brightness and contrast
+# entirely - training on merely darker images teaches the model nothing,
+# because standardize() undoes it before the CNN sees anything. What survives
+# is everything nonlinear or information-destroying:
+#
+#   gamma        - tone curve, not a scale factor
+#   noise        - added after the signal, scales up as the signal is scaled
+#   blur         - removes high frequencies permanently
+#   downscale    - removes detail permanently
+#   jpeg         - blocking and ringing artifacts
+#   black crush  - clipping; those pixels are simply gone
+#
+# Each is applied independently with its own probability, so a good fraction of
+# every batch stays clean or near-clean. That matters: degrading everything
+# would trade clean-image accuracy for robustness instead of adding robustness.
+# ---------------------------------------------------------------------------
+from io import BytesIO  # noqa: E402
+
+# Probability that a given training image gets degraded at all.
+DEGRADE_P = 0.65
+
+
+def degrade_image(img, rng=None, strength=1.0):
+    """Push a clean 48x48 image toward webcam conditions.
+
+    Accepts uint8 or float (0-255) and returns float32 in 0-255, so it can be
+    used directly as a Keras `preprocessing_function` - which runs after the
+    geometric augmentation and immediately before samplewise normalization.
+    """
+    rng = rng if rng is not None else np.random.default_rng()
+    x = np.asarray(img, dtype=np.float32)
+    if x.ndim == 3:            # (H, W, 1) from the Keras generator
+        x = x[..., 0]
+        had_channel = True
+    else:
+        had_channel = False
+
+    if rng.random() < DEGRADE_P * strength:
+        # --- low light: gamma darkening plus a gain drop ---------------------
+        # Gamma is the part standardize() cannot undo; the gain mostly cancels,
+        # but it is what makes the noise and quantization below realistic.
+        if rng.random() < 0.7:
+            gamma = float(rng.uniform(1.0, 2.4))
+            gain = float(rng.uniform(0.35, 1.0))
+            x = 255.0 * gain * np.power(np.clip(x, 0, 255) / 255.0, gamma)
+
+            # Crushed blacks: dim sensors clip the bottom of the range, and
+            # that information is genuinely unrecoverable.
+            if rng.random() < 0.4:
+                x = np.clip(x - float(rng.uniform(0, 12)), 0, 255)
+
+        # --- blur: defocus or motion ----------------------------------------
+        if rng.random() < 0.45:
+            radius = float(rng.uniform(0.3, 1.5))
+            pil = Image.fromarray(np.clip(x, 0, 255).astype(np.uint8), mode="L")
+            x = np.asarray(
+                pil.filter(ImageFilter.GaussianBlur(radius)), dtype=np.float32
+            )
+
+        # --- resolution loss: a soft or upscaled webcam ----------------------
+        if rng.random() < 0.35:
+            small = int(rng.integers(20, 40))
+            pil = Image.fromarray(np.clip(x, 0, 255).astype(np.uint8), mode="L")
+            pil = pil.resize((small, small), Image.BILINEAR)
+            x = np.asarray(
+                pil.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32
+            )
+
+        # --- sensor noise ----------------------------------------------------
+        # Noise is added AFTER darkening, which is the right order: a dim sensor
+        # is noisy relative to its signal, and that ratio is what standardize()
+        # preserves and the model must learn to see through.
+        if rng.random() < 0.6:
+            sigma = float(rng.uniform(2.0, 14.0))
+            x = x + rng.normal(0.0, sigma, x.shape).astype(np.float32)
+
+        # --- compression artifacts -------------------------------------------
+        if rng.random() < 0.25:
+            buf = BytesIO()
+            Image.fromarray(np.clip(x, 0, 255).astype(np.uint8), mode="L").save(
+                buf, format="JPEG", quality=int(rng.integers(18, 60))
+            )
+            buf.seek(0)
+            x = np.asarray(Image.open(buf).convert("L"), dtype=np.float32)
+
+    x = np.clip(x, 0, 255)
+    return x[..., np.newaxis] if had_channel else x

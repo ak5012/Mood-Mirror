@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from compat import MODEL_EXT, EMOTIONS, describe, keras
-from data import load_fer2013, standardize
+from data import load_fer2013, standardize, degrade_image
 from models import build_ann_baseline, build_cnn
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "artifacts"
@@ -67,14 +67,18 @@ def class_weights_for(y):
     }
 
 
-def train_model(model, Xtr, ytr, Xva, yva, name, epochs, batch_size):
+def train_model(model, Xtr, ytr, Xva, yva, name, epochs, batch_size, degrade=True):
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=1e-3),
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"],
     )
 
+    # preprocessing_function runs at the START of standardize(), i.e. after the
+    # geometric transforms and immediately before samplewise normalization -
+    # exactly where sensor degradation belongs. Validation never sees it.
     aug = keras.preprocessing.image.ImageDataGenerator(
+        preprocessing_function=(degrade_image if degrade else None),
         rotation_range=15,
         zoom_range=0.1,
         width_shift_range=0.1,
@@ -200,6 +204,8 @@ def main():
     ap.add_argument("--epochs-ann", type=int, default=30)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--quick", action="store_true", help="3 epochs each, for a smoke run")
+    ap.add_argument("--no-degrade", action="store_true",
+                    help="disable webcam-condition augmentation (noise/blur/gamma/jpeg)")
     args = ap.parse_args()
     if args.quick:
         args.epochs_cnn = args.epochs_ann = 3
@@ -214,7 +220,8 @@ def main():
 
     print("\n" + "=" * 60 + "\nANN baseline\n" + "=" * 60)
     ann = build_ann_baseline()
-    h = train_model(ann, Xtr, ytr, Xva, yva, "ANN Baseline", args.epochs_ann, args.batch_size)
+    h = train_model(ann, Xtr, ytr, Xva, yva, "ANN Baseline", args.epochs_ann,
+                    args.batch_size, degrade=not args.no_degrade)
     _plot_history(h, "ANN Baseline")
     ann_acc, _ = evaluate_model(ann, Xte, yte, "ANN Baseline")
     ann.save(OUTPUT_DIR / f"ann_baseline{MODEL_EXT}")
@@ -222,7 +229,8 @@ def main():
 
     print("\n" + "=" * 60 + "\nCNN\n" + "=" * 60)
     cnn = build_cnn()
-    h = train_model(cnn, Xtr, ytr, Xva, yva, "CNN", args.epochs_cnn, args.batch_size)
+    h = train_model(cnn, Xtr, ytr, Xva, yva, "CNN", args.epochs_cnn,
+                    args.batch_size, degrade=not args.no_degrade)
     _plot_history(h, "CNN")
     cnn_acc, cnn_metrics = evaluate_model(cnn, Xte, yte, "CNN")
     cnn.save(OUTPUT_DIR / f"cnn{MODEL_EXT}")

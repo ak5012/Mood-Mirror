@@ -66,6 +66,41 @@ is predicted far too often (precision 0.269 on just 111 test images) while
 `fear` and `sad` stay too conservative. Softening the weights to
 `sqrt(inverse-frequency)` is the standard fix and is the next thing to try.
 
+### Robustness to webcam conditions
+
+Clean test accuracy does not predict webcam accuracy - FER2013 is evenly lit
+and sharp, a real webcam feed is neither. `training/evaluate_robustness.py`
+measures that gap with fixed, seeded corruptions.
+
+Baseline (model trained **without** webcam-condition augmentation):
+
+| Condition | Accuracy | vs clean |
+|---|---|---|
+| clean | 61.67% | — |
+| dim_only (linear darkening) | 61.67% | **+0.00%** |
+| dim_gamma | 60.63% | −1.04% |
+| jpeg (q25) | 51.70% | −9.97% |
+| noisy (σ10) | 42.11% | −19.56% |
+| blurry (r1.2) | 41.88% | −19.80% |
+| low_res (24px) | 41.04% | −20.63% |
+| dim + noisy | 32.07% | −29.60% |
+| **webcam_hard** (combined) | **31.65%** | **−30.02%** |
+
+Two things follow from this.
+
+**Low light by itself is not the problem.** `dim_only` moves the number by
+exactly 0.00%, because per-image standardization is linear and removes
+brightness completely. That is also a clean empirical confirmation that the
+Python/browser parity contract holds.
+
+**Noise, blur and resolution loss are the problem** - which is what a cheap
+sensor produces *in* low light. Under realistic combined conditions the model
+loses roughly half its accuracy.
+
+`degrade_image()` in `data.py` trains against exactly these corruptions
+(gamma, black crush, blur, downscale, sensor noise, JPEG), applied per batch
+with 35% of images left clean so clean-image accuracy is not traded away.
+
 ### Export verification
 
 The Keras → TF.js chain is verified end to end, not assumed:
