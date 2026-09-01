@@ -315,3 +315,101 @@ def degrade_image(img, rng=None, strength=1.0):
 
     x = np.clip(x, 0, 255)
     return x[..., np.newaxis] if had_channel else x
+
+
+# ---------------------------------------------------------------------------
+# Random erasing (Zhong et al., 2020)
+#
+# Blanks a random rectangle of the face. It forces the model to spread evidence
+# across the whole face instead of leaning on one region - which matters here
+# because several FER2013 classes hinge on a single feature (surprise on the
+# eyes, happy on the mouth). A model that has only ever seen complete faces
+# degrades badly when a hand, hair, or the frame edge covers part of one.
+#
+# Published FER2013 results in the 70%+ range use this alongside heavy
+# geometric augmentation, which is what makes it worth the cost here.
+# ---------------------------------------------------------------------------
+ERASE_P = 0.35
+ERASE_AREA = (0.02, 0.18)     # fraction of the 48x48 image
+ERASE_ASPECT = (0.4, 2.5)
+
+
+def random_erase(img, rng=None):
+    """Zero out one random rectangle. Input/output float or uint8 (H,W[,1])."""
+    rng = rng if rng is not None else np.random.default_rng()
+    x = np.asarray(img, dtype=np.float32)
+    squeeze = x.ndim == 3
+    if squeeze:
+        x = x[..., 0]
+
+    if rng.random() < ERASE_P:
+        h, w = x.shape
+        for _ in range(10):     # retry until a box fits
+            area = h * w * float(rng.uniform(*ERASE_AREA))
+            aspect = float(rng.uniform(*ERASE_ASPECT))
+            eh, ew = int(round(np.sqrt(area * aspect))), int(round(np.sqrt(area / aspect)))
+            if eh < h and ew < w and eh > 0 and ew > 0:
+                top = int(rng.integers(0, h - eh))
+                left = int(rng.integers(0, w - ew))
+                # Fill with the image's own mean rather than 0: a black box is a
+                # strong edge the conv filters would latch onto as a feature.
+                x[top:top + eh, left:left + ew] = float(x.mean())
+                break
+
+    return x[..., np.newaxis] if squeeze else x
+
+
+def train_preprocess(img):
+    """Full training-time pixel pipeline: sensor degradation, then erasing.
+
+    Used as the Keras `preprocessing_function`, so it runs after the geometric
+    transforms and immediately before samplewise normalization.
+    """
+    return random_erase(degrade_image(img))
+
+
+# ---------------------------------------------------------------------------
+# Ten-crop test-time augmentation
+#
+# The standard TTA used by the published 70%+ FER2013 results: upscale slightly,
+# take 48x48 crops at the four corners and centre, mirror each, and average the
+# ten predictions. It buys roughly a point for ten forward passes and no
+# retraining, because averaging over crops cancels the model's sensitivity to
+# exactly where the face sits in the frame.
+#
+# Ten passes is too expensive for the browser at 30fps - the page uses the
+# two-crop version (image + mirror). This is for offline evaluation, where it
+# gives the fairest picture of what the weights are actually capable of.
+# ---------------------------------------------------------------------------
+TEN_CROP_UPSCALE = 54
+
+
+def ten_crop(imgs, upscale=TEN_CROP_UPSCALE):
+    """uint8 (N,48,48) -> float32 (10,N,48,48): 5 crops x {identity, mirror}."""
+    n = len(imgs)
+    big = np.empty((n, upscale, upscale), dtype=np.uint8)
+    for i in range(n):
+        pil = Image.fromarray(imgs[i].astype(np.uint8), "L")
+        big[i] = np.asarray(pil.resize((upscale, upscale), Image.BILINEAR))
+
+    d = upscale - IMG_SIZE
+    c = d // 2
+    offsets = [(0, 0), (0, d), (d, 0), (d, d), (c, c)]   # corners + centre
+
+    out = []
+    for top, left in offsets:
+        crop = big[:, top:top + IMG_SIZE, left:left + IMG_SIZE]
+        out.append(crop)
+        out.append(crop[:, :, ::-1])                      # mirror
+    return np.stack(out).astype(np.float32)
+
+
+def predict_ten_crop(model, imgs, batch_size=256):
+    """Average softmax over the ten crops. Returns (N, n_classes)."""
+    crops = ten_crop(imgs)
+    total = None
+    for view in crops:
+        p = model.predict(standardize(view)[..., np.newaxis],
+                          batch_size=batch_size, verbose=0)
+        total = p if total is None else total + p
+    return total / len(crops)

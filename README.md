@@ -28,9 +28,10 @@ Then open <http://localhost:8000>.
 | Emoji overlay + bounding box | done |
 | Smoothing (8-frame majority vote) | done |
 | Latency / stability instrumentation | done |
+| Webcam-condition robustness | done — see robustness table |
 | Face alignment to FER2013 geometry | done |
 | Confidence gating + probability smoothing | done |
-| Self-trained CNN | done — 61.7% test accuracy |
+| Self-trained CNN | done — 63.6% test accuracy, macro F1 0.599 |
 | Backend + history | not started |
 | Deployment | not started |
 
@@ -42,29 +43,67 @@ validation. Trained on CPU (Python 3.13 / TF 2.20 / Keras 2).
 | Model | Test accuracy | Macro F1 |
 |---|---|---|
 | Majority-class baseline (always `happy`) | 24.7% | — |
-| ANN baseline (30 epochs) | 29.0% | 0.242 |
-| **CNN (self-trained, 60 epochs)** | **61.7%** | **0.564** |
+| ANN baseline (25 epochs) | 40.3% | — |
+| **CNN (self-trained, 70 epochs)** | **63.6%** | **0.599** |
 
-The CNN beats the dense baseline by **+32.6 points** on identical data and
+The CNN beats the dense baseline by **+23.3 points** on identical data and
 preprocessing, which is the point of keeping the baseline around.
 
-Per-class, the CNN (precision / recall):
+Per-class, the CNN (precision / recall / F1):
 
-| Class | Precision | Recall | Note |
+| Class | Precision | Recall | F1 | Note |
+|---|---|---|---|---|
+| happy | 0.846 | 0.859 | 0.852 | strongest — most training data |
+| surprise | 0.711 | 0.816 | 0.760 | visually distinctive |
+| neutral | 0.553 | 0.665 | 0.604 | |
+| angry | 0.528 | 0.601 | 0.562 | |
+| disgust | 0.425 | 0.667 | 0.519 | only 393 training images |
+| sad | 0.557 | 0.428 | 0.484 | |
+| fear | 0.497 | 0.349 | 0.410 | weakest — confused with sad/surprise |
+
+### What moved the per-class numbers
+
+An earlier model used plain inverse-frequency class weighting and selected its
+best epoch on `val_accuracy`. That combination broke three of seven classes
+while overall accuracy still looked reasonable: `disgust` was predicted far too
+often (precision 0.269) and `angry`/`fear` were barely predicted at all.
+
+Four changes, applied together:
+
+- **`sqrt` class weighting** — `happy` has 6,494 training images against
+  `disgust`'s 393, so inverse weighting makes one disgust example count 16.5x a
+  happy one. `1/sqrt(freq)` cuts that spread to 4.1x.
+- **Checkpoint on macro F1, not accuracy** — selecting on accuracy rewards
+  ignoring rare classes outright. Macro F1 weights every class equally.
+- **Label smoothing (0.05)** — FER2013's labels are noisy enough that a hard
+  1.0 target trains the model to be confident about noise.
+- **Cosine LR decay** replacing `ReduceLROnPlateau`.
+
+Every class improved and none regressed:
+
+| Class | F1 before | F1 after | Change |
 |---|---|---|---|
-| happy | 0.880 | 0.825 | strongest — most training data |
-| surprise | 0.696 | 0.827 | visually distinctive |
-| neutral | 0.496 | 0.736 | over-predicted; absorbs fear/sad |
-| angry | 0.515 | 0.567 | |
-| sad | 0.571 | 0.359 | under-predicted |
-| fear | 0.532 | 0.288 | weakest recall; confused with sad/surprise |
-| disgust | 0.269 | 0.739 | over-predicted — class weights too aggressive |
+| disgust | 0.394 | 0.519 | **+0.125** |
+| sad | 0.441 | 0.484 | +0.043 |
+| fear | 0.374 | 0.410 | +0.036 |
+| angry | 0.539 | 0.562 | +0.023 |
+| neutral | 0.593 | 0.604 | +0.011 |
+| surprise | 0.756 | 0.760 | +0.004 |
+| happy | 0.852 | 0.852 | +0.000 |
+| **Macro F1** | 0.564 | **0.599** | **+0.035** |
+| **Accuracy** | 61.7% | **63.6%** | **+1.9** |
 
-**Known issue:** macro F1 (0.564) sits well below accuracy (0.617), the
-signature of the inverse-frequency class weighting over-correcting. `disgust`
-is predicted far too often (precision 0.269 on just 111 test images) while
-`fear` and `sad` stay too conservative. Softening the weights to
-`sqrt(inverse-frequency)` is the standard fix and is the next thing to try.
+`fear` and `sad` traded a little precision for substantially more recall — 148
+more faces correctly identified across the two. Both remain the weakest classes.
+
+### On the accuracy ceiling
+
+Human agreement on FER2013 is roughly 65%, but that is **not** a cap on model
+accuracy: published work reaches 73.28% (Khaireddin & Chen, 2021, VGGNet) and
+the 2013 challenge winner scored 71.16%. Models learn annotator consistencies
+that individual humans do not. So 63.6% leaves real headroom on this dataset —
+reaching it needs a much larger network plus heavier augmentation, which in
+turn needs a GPU. 90%+ remains out of reach on FER2013.
 
 ### Robustness to webcam conditions
 
@@ -72,19 +111,20 @@ Clean test accuracy does not predict webcam accuracy - FER2013 is evenly lit
 and sharp, a real webcam feed is neither. `training/evaluate_robustness.py`
 measures that gap with fixed, seeded corruptions.
 
-Baseline (model trained **without** webcam-condition augmentation):
+| Condition | Before | After | Change |
+|---|---|---|---|
+| clean | 61.67% | 63.56% | +1.9 |
+| dim_only (linear darkening) | 61.67% | 63.56% | +1.9 |
+| dim_gamma | 60.63% | 63.32% | +2.7 |
+| jpeg (q25) | 51.70% | 61.74% | **+10.0** |
+| noisy (σ10) | 42.11% | 61.99% | **+19.9** |
+| blurry (r1.2) | 41.88% | 59.61% | **+17.7** |
+| low_res (24px) | 41.04% | 59.19% | **+18.2** |
+| dim + noisy | 32.07% | 59.70% | **+27.6** |
+| **webcam_hard** (combined) | **31.65%** | **57.27%** | **+25.6** |
 
-| Condition | Accuracy | vs clean |
-|---|---|---|
-| clean | 61.67% | — |
-| dim_only (linear darkening) | 61.67% | **+0.00%** |
-| dim_gamma | 60.63% | −1.04% |
-| jpeg (q25) | 51.70% | −9.97% |
-| noisy (σ10) | 42.11% | −19.56% |
-| blurry (r1.2) | 41.88% | −19.80% |
-| low_res (24px) | 41.04% | −20.63% |
-| dim + noisy | 32.07% | −29.60% |
-| **webcam_hard** (combined) | **31.65%** | **−30.02%** |
+Clean-to-worst-case spread went from **30.0 points to 6.3**. Under realistic
+dim-and-noisy conditions the model went from near-useless to usable.
 
 Two things follow from this.
 

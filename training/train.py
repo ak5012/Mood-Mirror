@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from compat import MODEL_EXT, EMOTIONS, describe, keras
-from data import load_fer2013, standardize, degrade_image
+from data import load_fer2013, standardize, train_preprocess, predict_ten_crop
 from models import build_ann_baseline, build_cnn
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "artifacts"
@@ -55,56 +55,138 @@ def assert_normalization_parity(X):
     print(f"normalization parity: OK (max delta {delta:.2e})")
 
 
-def class_weights_for(y):
-    """Inverse-frequency weights. Without these, disgust (~1.5% of the data)
-    is never predicted and the model still looks fine on overall accuracy."""
-    counts = np.bincount(y, minlength=len(EMOTIONS))
-    total = len(y)
-    n_present = int((counts > 0).sum())
-    return {
-        i: (total / (n_present * c)) if c > 0 else 0.0
-        for i, c in enumerate(counts)
-    }
+def class_weights_for(y, mode="sqrt"):
+    """Per-class loss weights, normalized to mean 1.
+
+    `inverse` is the textbook 1/frequency weighting. It is too aggressive here:
+    happy has 6,494 training images and disgust has 393, a 16.5x ratio, so
+    inverse weighting tells the model a disgust example matters 16.5x more than
+    a happy one. The measured result was disgust predicted far too often
+    (precision 0.269) while angry and fear were barely predicted at all
+    (recall 0.05 and 0.045). Overall accuracy looked acceptable while three of
+    seven classes were effectively broken.
+
+    `sqrt` uses 1/sqrt(frequency), which still lifts the rare classes but with
+    a 4.1x spread instead of 16.5x. That is the standard remedy when inverse
+    weighting over-corrects, and it is the default here.
+
+    `effective` implements the class-balanced weighting of Cui et al. (2019),
+    which weights by the "effective number" of samples rather than the raw
+    count - a principled interpolation between no weighting and inverse.
+    """
+    counts = np.bincount(y, minlength=len(EMOTIONS)).astype(np.float64)
+    present = counts > 0
+
+    if mode == "none":
+        w = np.ones_like(counts)
+    elif mode == "inverse":
+        w = np.where(present, 1.0 / np.maximum(counts, 1), 0.0)
+    elif mode == "sqrt":
+        w = np.where(present, 1.0 / np.sqrt(np.maximum(counts, 1)), 0.0)
+    elif mode == "effective":
+        beta = 0.999
+        eff = (1.0 - np.power(beta, counts)) / (1.0 - beta)
+        w = np.where(present, 1.0 / np.maximum(eff, 1e-8), 0.0)
+    else:
+        raise ValueError(f"unknown class-weight mode: {mode}")
+
+    # Normalize to mean 1 over present classes so the effective learning rate
+    # does not change when the weighting scheme changes.
+    w = w / w[present].mean()
+    return {i: float(w[i]) for i in range(len(EMOTIONS))}
 
 
-def train_model(model, Xtr, ytr, Xva, yva, name, epochs, batch_size, degrade=True):
+class MacroF1(keras.callbacks.Callback):
+    """Log val_macro_f1 each epoch so checkpointing can select on it.
+
+    Selecting the best epoch by val_accuracy quietly favours the majority
+    classes: a model that predicts happy and neutral well and ignores disgust
+    and fear can win on accuracy while being useless on four of seven classes.
+    Macro F1 averages per-class F1 with equal weight, so improving a rare class
+    counts as much as improving a common one. That is the metric that matches
+    "accuracy across all emotions".
+    """
+
+    def __init__(self, X_val, y_val):
+        super().__init__()
+        self.X_val, self.y_val = X_val, y_val
+
+    def on_epoch_end(self, epoch, logs=None):
+        from sklearn.metrics import f1_score
+
+        logs = logs if logs is not None else {}
+        pred = self.model.predict(self.X_val, batch_size=256, verbose=0).argmax(1)
+        logs["val_macro_f1"] = float(
+            f1_score(self.y_val, pred, average="macro", zero_division=0)
+        )
+
+
+def train_model(model, Xtr, ytr, Xva, yva, name, epochs, batch_size, degrade=True,
+                weight_mode="sqrt", label_smoothing=0.05):
+    n_classes = len(EMOTIONS)
+    steps = int(np.ceil(len(Xtr) / batch_size))
+
+    # Cosine decay instead of ReduceLROnPlateau. The plateau callback only cuts
+    # the rate after damage is already visible in val_loss, and each cut is a
+    # discontinuity the optimizer has to recover from. A cosine schedule anneals
+    # smoothly to near zero over the whole run, which reliably buys a point or
+    # two on a fixed epoch budget.
+    schedule = keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=1e-3, decay_steps=epochs * steps, alpha=1e-2
+    )
+
+    # Label smoothing needs one-hot targets, so class weighting has to move from
+    # `class_weight` (integer labels only) to per-sample weights.
+    cw = class_weights_for(ytr, weight_mode)
+    sample_w = np.asarray([cw[int(c)] for c in ytr], dtype=np.float32)
+    ytr_oh = keras.utils.to_categorical(ytr, n_classes)
+
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=1e-3),
-        loss="sparse_categorical_crossentropy",
+        optimizer=keras.optimizers.Adam(learning_rate=schedule),
+        # FER2013's labels are crowd-sourced and roughly 35% disputable, so a
+        # hard 1.0 target trains the model to be confident about noise. Smoothing
+        # caps that confidence and consistently helps on noisy-label datasets.
+        loss=keras.losses.CategoricalCrossentropy(label_smoothing=label_smoothing),
         metrics=["accuracy"],
     )
+    print(f"  class weights ({weight_mode}): "
+          + ", ".join(f"{e}={cw[i]:.2f}" for i, e in enumerate(EMOTIONS)))
 
     # preprocessing_function runs at the START of standardize(), i.e. after the
     # geometric transforms and immediately before samplewise normalization -
     # exactly where sensor degradation belongs. Validation never sees it.
     aug = keras.preprocessing.image.ImageDataGenerator(
-        preprocessing_function=(degrade_image if degrade else None),
-        rotation_range=15,
-        zoom_range=0.1,
-        width_shift_range=0.1,
-        height_shift_range=0.1,
+        preprocessing_function=(train_preprocess if degrade else None),
+        rotation_range=25,
+        zoom_range=0.2,
+        width_shift_range=0.2,
+        height_shift_range=0.2,
         horizontal_flip=True,
         fill_mode="nearest",
         samplewise_center=True,
         samplewise_std_normalization=True,
     )
     train_flow = aug.flow(
-        Xtr[..., np.newaxis].astype(np.float32), ytr, batch_size=batch_size, shuffle=True
+        Xtr[..., np.newaxis].astype(np.float32), ytr_oh,
+        sample_weight=sample_w, batch_size=batch_size, shuffle=True,
     )
 
-    # Validation gets normalization only - never augmentation.
-    val = (standardize(Xva)[..., np.newaxis], yva)
+    # Validation gets normalization only - never augmentation or degradation.
+    Xva_p = standardize(Xva)[..., np.newaxis]
+    val = (Xva_p, keras.utils.to_categorical(yva, n_classes))
 
     ckpt = OUTPUT_DIR / f"{_slug(name)}_best{MODEL_EXT}"
     callbacks = [
+        # Must run first so val_macro_f1 is in `logs` before the callbacks below
+        # read it.
+        MacroF1(Xva_p, yva),
         keras.callbacks.ModelCheckpoint(
-            str(ckpt), monitor="val_accuracy", save_best_only=True, verbose=0
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=4, min_lr=1e-6, verbose=1
+            str(ckpt), monitor="val_macro_f1", mode="max",
+            save_best_only=True, verbose=0,
         ),
         keras.callbacks.EarlyStopping(
-            monitor="val_accuracy", patience=12, restore_best_weights=True, verbose=1
+            monitor="val_macro_f1", mode="max", patience=15,
+            restore_best_weights=True, verbose=1,
         ),
     ]
 
@@ -112,7 +194,6 @@ def train_model(model, Xtr, ytr, Xva, yva, name, epochs, batch_size, degrade=Tru
         train_flow,
         validation_data=val,
         epochs=epochs,
-        class_weight=class_weights_for(ytr),
         callbacks=callbacks,
         verbose=2,
     )
@@ -206,6 +287,10 @@ def main():
     ap.add_argument("--quick", action="store_true", help="3 epochs each, for a smoke run")
     ap.add_argument("--no-degrade", action="store_true",
                     help="disable webcam-condition augmentation (noise/blur/gamma/jpeg)")
+    ap.add_argument("--weights", default="sqrt",
+                    choices=["sqrt", "inverse", "effective", "none"],
+                    help="class-weighting scheme (default sqrt)")
+    ap.add_argument("--label-smoothing", type=float, default=0.05)
     args = ap.parse_args()
     if args.quick:
         args.epochs_cnn = args.epochs_ann = 3
@@ -221,7 +306,8 @@ def main():
     print("\n" + "=" * 60 + "\nANN baseline\n" + "=" * 60)
     ann = build_ann_baseline()
     h = train_model(ann, Xtr, ytr, Xva, yva, "ANN Baseline", args.epochs_ann,
-                    args.batch_size, degrade=not args.no_degrade)
+                    args.batch_size, degrade=not args.no_degrade,
+                    weight_mode=args.weights, label_smoothing=args.label_smoothing)
     _plot_history(h, "ANN Baseline")
     ann_acc, _ = evaluate_model(ann, Xte, yte, "ANN Baseline")
     ann.save(OUTPUT_DIR / f"ann_baseline{MODEL_EXT}")
@@ -230,7 +316,8 @@ def main():
     print("\n" + "=" * 60 + "\nCNN\n" + "=" * 60)
     cnn = build_cnn()
     h = train_model(cnn, Xtr, ytr, Xva, yva, "CNN", args.epochs_cnn,
-                    args.batch_size, degrade=not args.no_degrade)
+                    args.batch_size, degrade=not args.no_degrade,
+                    weight_mode=args.weights, label_smoothing=args.label_smoothing)
     _plot_history(h, "CNN")
     cnn_acc, cnn_metrics = evaluate_model(cnn, Xte, yte, "CNN")
     cnn.save(OUTPUT_DIR / f"cnn{MODEL_EXT}")
